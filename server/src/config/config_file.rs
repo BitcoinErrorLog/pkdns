@@ -194,23 +194,48 @@ pub struct Dht {
     #[serde(default = "default_dht_rate_limit_burst")]
     pub dht_query_rate_limit_burst: u32,
     #[serde(
-        default = "default_top_level_domain",
-        deserialize_with = "deserialize_top_level_domain"
+        default = "default_top_level_domains",
+        alias = "top_level_domain",
+        deserialize_with = "deserialize_top_level_domains"
     )]
-    pub top_level_domain: Option<TopLevelDomain>,
+    pub top_level_domains: Vec<TopLevelDomain>,
 }
 
-fn deserialize_top_level_domain<'de, D>(deserializer: D) -> Result<Option<TopLevelDomain>, D::Error>
+/// Deserialize top_level_domains from either a single string or an array of strings.
+fn deserialize_top_level_domains<'de, D>(deserializer: D) -> Result<Vec<TopLevelDomain>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    if let Some(tld) = &value {
-        if tld.is_empty() {
-            return Ok(None);
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TldValue {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    let value = TldValue::deserialize(deserializer)?;
+    match value {
+        TldValue::Single(s) => {
+            if s.is_empty() {
+                Ok(vec![])
+            } else {
+                Ok(vec![TopLevelDomain::new(s)])
+            }
+        }
+        TldValue::Multiple(v) => {
+            Ok(v.into_iter()
+                .filter(|s| !s.is_empty())
+                .map(TopLevelDomain::new)
+                .collect())
         }
     }
-    Ok(value.map(TopLevelDomain::new))
+}
+
+fn default_top_level_domains() -> Vec<TopLevelDomain> {
+    vec![
+        TopLevelDomain::new("pkarr".to_string()),
+        TopLevelDomain::new("key".to_string()),
+        TopLevelDomain::new("pubky".to_string()),
+    ]
 }
 
 fn default_cache_mb() -> NonZeroU64 {
@@ -225,17 +250,13 @@ fn default_dht_rate_limit_burst() -> u32 {
     25
 }
 
-fn default_top_level_domain() -> Option<TopLevelDomain> {
-    Some(TopLevelDomain::new("key".to_string()))
-}
-
 impl Default for Dht {
     fn default() -> Self {
         Self {
             dht_cache_mb: default_cache_mb(),
             dht_query_rate_limit: default_dht_rate_limit(),
             dht_query_rate_limit_burst: default_dht_rate_limit_burst(),
-            top_level_domain: default_top_level_domain(),
+            top_level_domains: default_top_level_domains(),
         }
     }
 }
@@ -259,10 +280,15 @@ mod tests {
     fn test_default_config_top_level_domain() {
         let config_str = "[dht]\ntop_level_domain = \"\"";
         let config = ConfigToml::try_from(config_str).unwrap();
-        assert!(config.dht.top_level_domain.is_none());
+        assert!(config.dht.top_level_domains.is_empty());
 
         let config_str = "[dht]\ntop_level_domain = \"test\"";
         let config = ConfigToml::try_from(config_str).unwrap();
-        assert_eq!(config.dht.top_level_domain.unwrap().0, "test".to_string());
+        assert_eq!(config.dht.top_level_domains.len(), 1);
+        assert_eq!(config.dht.top_level_domains[0].0, "test".to_string());
+
+        // Default includes pkarr, key, pubky
+        let config = ConfigToml::default();
+        assert_eq!(config.dht.top_level_domains.len(), 3);
     }
 }

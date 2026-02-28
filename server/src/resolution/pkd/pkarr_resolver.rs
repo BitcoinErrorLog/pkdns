@@ -5,8 +5,8 @@ use crate::{
     resolution::{dns_packets::ParsedQuery, DnsSocket, DnsSocketError, RateLimiter, RateLimiterBuilder},
 };
 use pkarr::{
-    dns::{Name, Question, ResourceRecord},
-    Client,
+    dns::{Name, Question, ResourceRecord, rdata::RData},
+    Client, SignedPacket,
 };
 use std::{
     collections::HashMap,
@@ -182,18 +182,18 @@ impl PkarrResolver {
         Ok(self.cache.add_packet(new_packet).await)
     }
 
-    fn remove_tld_if_necessary(&self, mut query: &mut Packet<'_>) -> bool {
-        if let Some(tld) = &self.context.config.dht.top_level_domain {
+    fn remove_tld_if_necessary(&self, mut query: &mut Packet<'_>) -> Option<usize> {
+        for (i, tld) in self.context.config.dht.top_level_domains.iter().enumerate() {
             if tld.question_ends_with_pubkey_tld(query) {
                 tld.remove(query);
-                return true;
+                return Some(i);
             }
         }
-        false
+        None
     }
 
-    fn add_tld_if_necessary(&self, mut reply: &mut Packet<'_>) -> bool {
-        if let Some(tld) = &self.context.config.dht.top_level_domain {
+    fn add_tld_if_necessary(&self, mut reply: &mut Packet<'_>, tld_index: usize) -> bool {
+        if let Some(tld) = self.context.config.dht.top_level_domains.get(tld_index) {
             tld.add(reply);
             return true;
         }
@@ -209,8 +209,8 @@ impl PkarrResolver {
         from: Option<IpAddr>,
     ) -> std::prelude::v1::Result<Vec<u8>, CustomHandlerError> {
         let mut request = query.packet.parsed().clone();
-        let mut removed_tld = self.remove_tld_if_necessary(&mut request);
-        if removed_tld {
+        let removed_tld = self.remove_tld_if_necessary(&mut request);
+        if removed_tld.is_some() {
             tracing::trace!("Removed tld from question: {:?}", request.questions.first().unwrap());
         }
 
@@ -254,9 +254,42 @@ impl PkarrResolver {
                 }
                 let reply = resolve_query(&packet, &request).await;
 
-                let reply = if removed_tld {
+                // If no direct answer, check for _pubky SVCB → homeserver chain
+                let parsed_reply = Packet::parse(&reply).unwrap();
+                if parsed_reply.answers.is_empty() && parsed_reply.name_servers.is_empty() {
+                    if let Some(homeserver_key) = extract_pubky_target(&signed_packet) {
+                        tracing::info!(
+                            "Following _pubky chain: {} → homeserver {}",
+                            pubkey.to_z32(),
+                            homeserver_key.to_z32()
+                        );
+                        if let Ok(hs_item) = self.resolve_pubkey_respect_cache(&homeserver_key, from).await {
+                            if !hs_item.not_found() {
+                                let hs_packet = hs_item.unwrap();
+                                let mut hs_dns = Packet::new_reply(0);
+                                for rr in hs_packet.all_resource_records() {
+                                    hs_dns.answers.push(rr.clone());
+                                }
+                                let hs_reply = resolve_query(&hs_dns, &request).await;
+                                let hs_parsed = Packet::parse(&hs_reply).unwrap();
+                                if !hs_parsed.answers.is_empty() {
+                                    let hs_reply = if let Some(tld_idx) = removed_tld {
+                                        let mut pkt = Packet::parse(&hs_reply).unwrap();
+                                        self.add_tld_if_necessary(&mut pkt, tld_idx);
+                                        pkt.build_bytes_vec().unwrap()
+                                    } else {
+                                        hs_reply
+                                    };
+                                    return Ok(hs_reply);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let reply = if let Some(tld_idx) = removed_tld {
                     let mut packet = Packet::parse(&reply).unwrap();
-                    self.add_tld_if_necessary(&mut packet);
+                    self.add_tld_if_necessary(&mut packet, tld_idx);
                     packet.build_bytes_vec().unwrap()
                 } else {
                     reply
@@ -266,6 +299,28 @@ impl PkarrResolver {
             Err(err) => Err(err),
         }
     }
+}
+
+/// Extract homeserver public key from a `_pubky` SVCB/HTTPS record in a signed packet.
+fn extract_pubky_target(packet: &SignedPacket) -> Option<PublicKey> {
+    for rr in packet.resource_records("_pubky") {
+        match &rr.rdata {
+            RData::SVCB(svcb) => {
+                let target = svcb.target.to_string();
+                if let Ok(pk) = PublicKey::try_from(target.as_str()) {
+                    return Some(pk);
+                }
+            }
+            RData::HTTPS(https) => {
+                let target = https.0.target.to_string();
+                if let Ok(pk) = PublicKey::try_from(target.as_str()) {
+                    return Some(pk);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
