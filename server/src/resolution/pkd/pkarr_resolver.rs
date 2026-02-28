@@ -270,15 +270,31 @@ impl PkarrResolver {
                                 for rr in hs_packet.all_resource_records() {
                                     hs_dns.answers.push(rr.clone());
                                 }
-                                let hs_reply = resolve_query(&hs_dns, &request).await;
-                                let hs_parsed = Packet::parse(&hs_reply).unwrap();
+                                // Build a query using the homeserver key as qname
+                                // so record name matching works against homeserver's records
+                                let hs_key_z32 = homeserver_key.to_z32();
+                                let hs_name = Name::new(&hs_key_z32).unwrap();
+                                let hs_question = Question::new(
+                                    hs_name,
+                                    question.qtype,
+                                    question.qclass,
+                                    question.unicast_response,
+                                ).into_owned();
+                                let mut hs_query = request.clone();
+                                hs_query.questions = vec![hs_question];
+                                let hs_reply = resolve_query(&hs_dns, &hs_query).await;
+                                let mut hs_parsed = Packet::parse(&hs_reply).unwrap();
                                 if !hs_parsed.answers.is_empty() {
+                                    // Rewrite answer names from homeserver key back to original user key
+                                    let original_name = question.qname.clone();
+                                    for answer in hs_parsed.answers.iter_mut() {
+                                        answer.name = original_name.clone();
+                                    }
                                     let hs_reply = if let Some(tld_idx) = removed_tld {
-                                        let mut pkt = Packet::parse(&hs_reply).unwrap();
-                                        self.add_tld_if_necessary(&mut pkt, tld_idx);
-                                        pkt.build_bytes_vec().unwrap()
+                                        self.add_tld_if_necessary(&mut hs_parsed, tld_idx);
+                                        hs_parsed.build_bytes_vec().unwrap()
                                     } else {
-                                        hs_reply
+                                        hs_parsed.build_bytes_vec().unwrap()
                                     };
                                     return Ok(hs_reply);
                                 }
